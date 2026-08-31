@@ -1,0 +1,8 @@
+.venv/
+.env
+__pycache__/
+bot.log
+bot.pid
+metrics.json
+ref_images/*
+!ref_images/.gitkeep
