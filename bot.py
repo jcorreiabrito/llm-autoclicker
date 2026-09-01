@@ -4,8 +4,12 @@ Allow-Bot
 Ultra-lightweight background automation that monitors a target VDI window
 and clicks the GitHub Copilot "Allow" permission dialog automatically.
 
-Includes human-like mouse movement (Bézier curves, easing, off-center landing,
-randomized reaction delays, and click dwell times) or instant mode.
+Includes advanced human-like neuromuscular mouse movement:
+- Asymmetric acceleration profiles (fast ballistic launch -> long homing deceleration)
+- Randomized Bézier curve trajectories and dynamic velocity
+- Correlated low-frequency hand sway / physiological tremor
+- Submovement overshoot and corrective adjustments
+- Natural reaction delays and realistic click dwell times
 """
 
 import os
@@ -131,7 +135,6 @@ def get_target_window_geometry(target_title: str):
                         except ValueError:
                             continue
             if candidates:
-                # Return the largest window if multiple match
                 candidates.sort(key=lambda item: item[2] * item[3], reverse=True)
                 return candidates[0]
     except Exception as e:
@@ -173,11 +176,27 @@ def bezier_point(p0, p1, p2, p3, t: float):
     y = uu * u * p0[1] + 3 * uu * t * p1[1] + 3 * u * tt * p2[1] + tt * t * p3[1]
     return int(round(x)), int(round(y))
 
+def asymmetric_ease(t: float, alpha: float, beta: float) -> float:
+    """
+    Computes an asymmetric ease curve based on randomized Beta distribution parameters.
+    Reaches peak velocity early (~30-40% of trajectory) and provides a longer deceleration tail.
+    """
+    t_clamped = max(0.0, min(1.0, t))
+    nom = t_clamped ** alpha
+    den = nom + ((1.0 - t_clamped) ** beta) + 1e-6
+    return nom / den
+
 def move_mouse_humanlike(target_x: int, target_y: int, speed_factor: float = 1.0):
-    """Moves mouse along a smooth cubic Bézier curve with natural ease-in/ease-out and micro-jitter."""
+    """
+    Moves mouse along a human-like neuromuscular trajectory with:
+    - Asymmetric acceleration (fast launch -> gentle homing)
+    - Dynamic velocity & randomized curvature
+    - Momentum-based hand drift / sway
+    - Submovement overshoot and corrective adjustment
+    """
     if not has_x11 or x11_display is None:
         return
-    
+
     start_x, start_y = get_current_pointer()
     distance = math.hypot(target_x - start_x, target_y - start_y)
     if distance < 4:
@@ -185,48 +204,78 @@ def move_mouse_humanlike(target_x: int, target_y: int, speed_factor: float = 1.0
         x11_display.sync()
         return
 
-    # Generate randomized curved control points
-    deviation = distance * random.uniform(0.08, 0.22)
-    angle = math.atan2(target_y - start_y, target_x - start_x)
-    norm_angle = angle + (math.pi / 2) * random.choice([-1, 1])
+    # 1. Decide if this movement will overshoot slightly (30% probability on long distance)
+    will_overshoot = (random.random() < 0.30) and (distance > 70)
+    if will_overshoot:
+        angle = math.atan2(target_y - start_y, target_x - start_x)
+        overshoot_dist = random.uniform(5, 14)
+        inter_target_x = int(target_x + math.cos(angle) * overshoot_dist + random.uniform(-4, 4))
+        inter_target_y = int(target_y + math.sin(angle) * overshoot_dist + random.uniform(-4, 4))
+    else:
+        inter_target_x, inter_target_y = target_x, target_y
 
-    ctrl1_dist = distance * random.uniform(0.25, 0.40)
-    ctrl1 = (
-        start_x + math.cos(angle) * ctrl1_dist + math.cos(norm_angle) * deviation * random.uniform(0.5, 1.0),
-        start_y + math.sin(angle) * ctrl1_dist + math.sin(norm_angle) * deviation * random.uniform(0.5, 1.0),
+    # 2. Randomized acceleration curve exponents for this specific movement
+    alpha = random.uniform(1.8, 2.4)   # Controls initial acceleration burst
+    beta = random.uniform(2.8, 4.2)    # Controls deceleration homing tail
+
+    # 3. Dynamic duration based on Fitts's law + speed profile
+    base_duration = (0.16 + (distance / 1500.0) * random.uniform(0.75, 1.25)) / max(0.1, speed_factor)
+    steps = max(18, int(distance / 10))
+    base_step_delay = base_duration / steps
+
+    # 4. Bézier control points with randomized curvature
+    deviation = distance * random.uniform(0.10, 0.25)
+    ang = math.atan2(inter_target_y - start_y, inter_target_x - start_x)
+    norm_ang = ang + (math.pi / 2) * random.choice([-1, 1])
+
+    c1 = (
+        start_x + math.cos(ang) * distance * 0.3 + math.cos(norm_ang) * deviation * random.uniform(0.6, 1.0),
+        start_y + math.sin(ang) * distance * 0.3 + math.sin(norm_ang) * deviation * random.uniform(0.6, 1.0),
+    )
+    c2 = (
+        start_x + math.cos(ang) * distance * 0.7 + math.cos(norm_ang) * deviation * random.uniform(0.1, 0.5),
+        start_y + math.sin(ang) * distance * 0.7 + math.sin(norm_ang) * deviation * random.uniform(0.1, 0.5),
     )
 
-    ctrl2_dist = distance * random.uniform(0.60, 0.80)
-    ctrl2 = (
-        start_x + math.cos(angle) * ctrl2_dist + math.cos(norm_angle) * deviation * random.uniform(0.2, 0.8),
-        start_y + math.sin(angle) * ctrl2_dist + math.sin(norm_angle) * deviation * random.uniform(0.2, 0.8),
-    )
-
-    # Duration based on distance (Fitts's Law approximation)
-    base_duration = max(0.12, min(0.55, (distance / 1600.0) + random.uniform(0.05, 0.12)))
-    total_duration = base_duration / max(0.1, speed_factor)
-    
-    # Step count for smooth ~60-100 fps trajectory
-    steps = max(12, int(distance / 15))
-    step_delay = total_duration / steps
-
+    # 5. Execute primary flight with correlated hand drift & dynamic step timing
+    drift_x, drift_y = 0.0, 0.0
     for i in range(1, steps + 1):
-        raw_t = i / steps
-        # Ease-in / Ease-out smoothstep curve
-        t = raw_t * raw_t * (3.0 - 2.0 * raw_t)
-        
-        px, py = bezier_point((start_x, start_y), ctrl1, ctrl2, (target_x, target_y), t)
-        
-        # Tiny natural jitter during movement
+        raw_progress = i / steps
+        t = asymmetric_ease(raw_progress, alpha, beta)
+
+        px, py = bezier_point((start_x, start_y), c1, c2, (inter_target_x, inter_target_y), t)
+
+        # Correlated hand sway (momentum drift)
+        drift_x = drift_x * 0.75 + random.uniform(-0.6, 0.6)
+        drift_y = drift_y * 0.75 + random.uniform(-0.6, 0.6)
+
         if i < steps:
-            px += random.randint(-1, 1)
-            py += random.randint(-1, 1)
+            px += int(round(drift_x))
+            py += int(round(drift_y))
 
         xtest.fake_input(x11_display, X.MotionNotify, x=px, y=py)
         x11_display.sync()
-        time.sleep(step_delay)
 
-    # Final position snap to exact target point
+        # Variable delta-t: micro-randomized timing jitter per step
+        jittered_delay = base_step_delay * random.uniform(0.85, 1.15)
+        time.sleep(jittered_delay)
+
+    # 6. Corrective submovement if overshot
+    if will_overshoot:
+        time.sleep(random.uniform(0.02, 0.05))  # Micro-pause before correction
+        correct_steps = random.randint(4, 7)
+        cur_x, cur_y = get_current_pointer()
+        for j in range(1, correct_steps + 1):
+            ct = j / correct_steps
+            # Linear/smooth step for micro-settling
+            st = ct * ct * (3.0 - 2.0 * ct)
+            cx = int(cur_x + (target_x - cur_x) * st)
+            cy = int(cur_y + (target_y - cur_y) * st)
+            xtest.fake_input(x11_display, X.MotionNotify, x=cx, y=cy)
+            display.sync()
+            time.sleep(random.uniform(0.008, 0.018))
+
+    # Final position confirmation
     xtest.fake_input(x11_display, X.MotionNotify, x=target_x, y=target_y)
     x11_display.sync()
 
@@ -238,7 +287,7 @@ def click_screen_box(box_x: int, box_y: int, box_w: int, box_h: int):
     
     try:
         if HUMAN_LIKE:
-            # 1. Reaction time hesitation
+            # 1. Cognitive reaction delay (random hesitation before responding)
             reaction_delay = random.uniform(HUMAN_MIN_REACTION, HUMAN_MAX_REACTION)
             time.sleep(reaction_delay)
 
@@ -253,7 +302,7 @@ def click_screen_box(box_x: int, box_y: int, box_w: int, box_h: int):
             target_x = random.randint(min_x, max_x)
             target_y = random.randint(min_y, max_y)
 
-            # 3. Smooth curved mouse movement
+            # 3. Smooth neuromuscular mouse movement
             move_mouse_humanlike(target_x, target_y, speed_factor=HUMAN_MOUSE_SPEED)
 
             # 4. Pre-click micro hesitation (30ms - 80ms)
@@ -352,7 +401,7 @@ def run_bot():
         sys.exit(1)
 
     write_pid()
-    mode_str = "HUMAN-LIKE (Bézier curves + randomized delays)" if HUMAN_LIKE else "INSTANT"
+    mode_str = "HUMAN-LIKE (Asymmetric Bézier curves + submovement correction)" if HUMAN_LIKE else "INSTANT"
     logger.info("Allow-Bot started (PID: %d) [Mode: %s]", os.getpid(), mode_str)
     logger.info(
         "Settings: target='%s', threshold=%.2f, interval=%.2fs, cooldown=%.2fs",
