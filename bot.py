@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Citrix Copilot Allow-Bot
-Ultra-lightweight background automation that monitors a Citrix VDI window
+Allow-Bot
+Ultra-lightweight background automation that monitors a target VDI window
 and clicks the GitHub Copilot "Allow" permission dialog automatically.
 
-Optimized for Linux/X11 with direct Xlib + OpenCV headless template matching.
-Steady-state memory footprint: ~45-55 MB RSS.
+Includes human-like mouse movement (Bézier curves, easing, off-center landing,
+randomized reaction delays, and click dwell times) or instant mode.
 """
 
 import os
@@ -14,6 +14,8 @@ import time
 import signal
 import logging
 import gc
+import math
+import random
 import subprocess
 from pathlib import Path
 import cv2
@@ -27,14 +29,21 @@ PROJECT_DIR = Path(__file__).resolve().parent
 ENV_PATH = PROJECT_DIR / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
+WINDOW_TITLE = (os.getenv("WINDOW_TITLE") or os.getenv("CITRIX_WINDOW_TITLE", "Citrix")).strip()
 SCAN_INTERVAL = float(os.getenv("SCAN_INTERVAL", "0.8"))
 MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.80"))
-CITRIX_WINDOW_TITLE = os.getenv("CITRIX_WINDOW_TITLE", "Citrix").strip()
 REF_IMAGES_DIR = PROJECT_DIR / os.getenv("REF_IMAGES_DIR", "ref_images")
 LOG_FILE = PROJECT_DIR / os.getenv("LOG_FILE", "bot.log")
 PID_FILE = PROJECT_DIR / os.getenv("PID_FILE", "bot.pid")
 CLICK_COOLDOWN = float(os.getenv("CLICK_COOLDOWN", "2.0"))
 DEBUG = int(os.getenv("DEBUG", "0")) == 1
+
+# Human-like simulation settings
+HUMAN_LIKE = int(os.getenv("HUMAN_LIKE", "1")) == 1
+HUMAN_MIN_REACTION = float(os.getenv("HUMAN_MIN_REACTION", "0.20"))
+HUMAN_MAX_REACTION = float(os.getenv("HUMAN_MAX_REACTION", "0.50"))
+HUMAN_MOUSE_SPEED = float(os.getenv("HUMAN_MOUSE_SPEED", "1.0"))
+HUMAN_SCAN_JITTER = int(os.getenv("HUMAN_SCAN_JITTER", "1")) == 1
 
 # Setup logging
 log_level = logging.DEBUG if DEBUG else logging.INFO
@@ -42,7 +51,7 @@ log_formatter = logging.Formatter(
     "[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-logger = logging.getLogger("citrix_allow_bot")
+logger = logging.getLogger("allow_bot")
 logger.setLevel(log_level)
 logger.handlers.clear()
 
@@ -91,7 +100,7 @@ def remove_pid():
     except Exception as e:
         logger.warning("Failed to remove PID file: %s", e)
 
-def get_citrix_window_geometry(target_title: str):
+def get_target_window_geometry(target_title: str):
     """
     Finds the window matching target_title using wmctrl -l -G.
     Returns (x, y, width, height, title) or None.
@@ -144,19 +153,130 @@ def capture_x11_region(x: int, y: int, width: int, height: int):
         logger.error("Failed to capture X11 region (%d, %d, %d, %d): %s", x, y, width, height, e)
         return None
 
-def click_screen_point(x: int, y: int):
-    """Simulates a left mouse click at absolute coordinates (x, y) using XTest."""
+def get_current_pointer():
+    """Returns the current (x, y) coordinates of the mouse cursor."""
+    if not has_x11 or x11_root is None:
+        return 0, 0
+    try:
+        data = x11_root.query_pointer()._data
+        return data["root_x"], data["root_y"]
+    except Exception as e:
+        logger.debug("Failed to query pointer: %s", e)
+        return 0, 0
+
+def bezier_point(p0, p1, p2, p3, t: float):
+    """Calculates a point along a Cubic Bézier curve at parameter t (0.0 to 1.0)."""
+    u = 1.0 - t
+    tt = t * t
+    uu = u * u
+    x = uu * u * p0[0] + 3 * uu * t * p1[0] + 3 * u * tt * p2[0] + tt * t * p3[0]
+    y = uu * u * p0[1] + 3 * uu * t * p1[1] + 3 * u * tt * p2[1] + tt * t * p3[1]
+    return int(round(x)), int(round(y))
+
+def move_mouse_humanlike(target_x: int, target_y: int, speed_factor: float = 1.0):
+    """Moves mouse along a smooth cubic Bézier curve with natural ease-in/ease-out and micro-jitter."""
+    if not has_x11 or x11_display is None:
+        return
+    
+    start_x, start_y = get_current_pointer()
+    distance = math.hypot(target_x - start_x, target_y - start_y)
+    if distance < 4:
+        xtest.fake_input(x11_display, X.MotionNotify, x=target_x, y=target_y)
+        x11_display.sync()
+        return
+
+    # Generate randomized curved control points
+    deviation = distance * random.uniform(0.08, 0.22)
+    angle = math.atan2(target_y - start_y, target_x - start_x)
+    norm_angle = angle + (math.pi / 2) * random.choice([-1, 1])
+
+    ctrl1_dist = distance * random.uniform(0.25, 0.40)
+    ctrl1 = (
+        start_x + math.cos(angle) * ctrl1_dist + math.cos(norm_angle) * deviation * random.uniform(0.5, 1.0),
+        start_y + math.sin(angle) * ctrl1_dist + math.sin(norm_angle) * deviation * random.uniform(0.5, 1.0),
+    )
+
+    ctrl2_dist = distance * random.uniform(0.60, 0.80)
+    ctrl2 = (
+        start_x + math.cos(angle) * ctrl2_dist + math.cos(norm_angle) * deviation * random.uniform(0.2, 0.8),
+        start_y + math.sin(angle) * ctrl2_dist + math.sin(norm_angle) * deviation * random.uniform(0.2, 0.8),
+    )
+
+    # Duration based on distance (Fitts's Law approximation)
+    base_duration = max(0.12, min(0.55, (distance / 1600.0) + random.uniform(0.05, 0.12)))
+    total_duration = base_duration / max(0.1, speed_factor)
+    
+    # Step count for smooth ~60-100 fps trajectory
+    steps = max(12, int(distance / 15))
+    step_delay = total_duration / steps
+
+    for i in range(1, steps + 1):
+        raw_t = i / steps
+        # Ease-in / Ease-out smoothstep curve
+        t = raw_t * raw_t * (3.0 - 2.0 * raw_t)
+        
+        px, py = bezier_point((start_x, start_y), ctrl1, ctrl2, (target_x, target_y), t)
+        
+        # Tiny natural jitter during movement
+        if i < steps:
+            px += random.randint(-1, 1)
+            py += random.randint(-1, 1)
+
+        xtest.fake_input(x11_display, X.MotionNotify, x=px, y=py)
+        x11_display.sync()
+        time.sleep(step_delay)
+
+    # Final position snap to exact target point
+    xtest.fake_input(x11_display, X.MotionNotify, x=target_x, y=target_y)
+    x11_display.sync()
+
+def click_screen_box(box_x: int, box_y: int, box_w: int, box_h: int):
+    """Simulates a human-like or instant left mouse click inside a bounding box."""
     if not has_x11 or x11_display is None:
         logger.error("Cannot click: X11 display is unavailable.")
         return False
+    
     try:
-        xtest.fake_input(x11_display, X.MotionNotify, x=x, y=y)
-        xtest.fake_input(x11_display, X.ButtonPress, 1)
-        xtest.fake_input(x11_display, X.ButtonRelease, 1)
-        x11_display.sync()
+        if HUMAN_LIKE:
+            # 1. Reaction time hesitation
+            reaction_delay = random.uniform(HUMAN_MIN_REACTION, HUMAN_MAX_REACTION)
+            time.sleep(reaction_delay)
+
+            # 2. Pick a randomized landing point within button boundaries (inner 20%-80%)
+            pad_w = int(box_w * 0.20)
+            pad_h = int(box_h * 0.20)
+            min_x = box_x + pad_w
+            max_x = box_x + max(pad_w, box_w - pad_w)
+            min_y = box_y + pad_h
+            max_y = box_y + max(pad_h, box_h - pad_h)
+
+            target_x = random.randint(min_x, max_x)
+            target_y = random.randint(min_y, max_y)
+
+            # 3. Smooth curved mouse movement
+            move_mouse_humanlike(target_x, target_y, speed_factor=HUMAN_MOUSE_SPEED)
+
+            # 4. Pre-click micro hesitation (30ms - 80ms)
+            time.sleep(random.uniform(0.03, 0.08))
+
+            # 5. Click with realistic down/up dwell time
+            xtest.fake_input(x11_display, X.ButtonPress, 1)
+            x11_display.sync()
+            time.sleep(random.uniform(0.05, 0.12))
+            xtest.fake_input(x11_display, X.ButtonRelease, 1)
+            x11_display.sync()
+        else:
+            # Instant snap and click
+            center_x = box_x + (box_w // 2)
+            center_y = box_y + (box_h // 2)
+            xtest.fake_input(x11_display, X.MotionNotify, x=center_x, y=center_y)
+            xtest.fake_input(x11_display, X.ButtonPress, 1)
+            xtest.fake_input(x11_display, X.ButtonRelease, 1)
+            x11_display.sync()
+
         return True
     except Exception as e:
-        logger.error("Error simulating click at (%d, %d): %s", x, y, e)
+        logger.error("Error simulating click at (%d, %d, %dx%d): %s", box_x, box_y, box_w, box_h, e)
         return False
 
 class MetricsTracker:
@@ -197,7 +317,6 @@ class MetricsTracker:
         now = time.time()
         elapsed = now - self.start_time
         self.start_time = now
-        
         record = self.get_today_record()
         record["run_time_seconds"] += elapsed
         
@@ -227,16 +346,17 @@ def load_templates(ref_dir: Path):
                 logger.warning("Could not parse image: %s", img_path.name)
     return templates
 
-def main():
+def run_bot():
     if not has_x11:
         logger.critical("X11 display could not be opened. Terminating.")
         sys.exit(1)
 
     write_pid()
-    logger.info("Citrix Copilot Allow-Bot started (PID: %d)", os.getpid())
+    mode_str = "HUMAN-LIKE (Bézier curves + randomized delays)" if HUMAN_LIKE else "INSTANT"
+    logger.info("Allow-Bot started (PID: %d) [Mode: %s]", os.getpid(), mode_str)
     logger.info(
         "Settings: target='%s', threshold=%.2f, interval=%.2fs, cooldown=%.2fs",
-        CITRIX_WINDOW_TITLE,
+        WINDOW_TITLE,
         MATCH_THRESHOLD,
         SCAN_INTERVAL,
         CLICK_COOLDOWN,
@@ -262,20 +382,20 @@ def main():
             if not templates:
                 if iteration % 15 == 1:
                     logger.warning(
-                        "No reference images found in '%s'. Run 'python capture.py' to save the 'Allow' button.",
+                        "No reference images found in '%s'. Run 'python capture.py' to save the target button.",
                         REF_IMAGES_DIR.name,
                     )
                 time.sleep(SCAN_INTERVAL)
                 continue
 
-            # Find Citrix window
-            win_info = get_citrix_window_geometry(CITRIX_WINDOW_TITLE)
+            # Find target window
+            win_info = get_target_window_geometry(WINDOW_TITLE)
             if not win_info:
                 now = time.time()
                 if now - last_window_missing_log > 30.0:
                     logger.info(
                         "Window containing '%s' not found. Standing by...",
-                        CITRIX_WINDOW_TITLE,
+                        WINDOW_TITLE,
                     )
                     last_window_missing_log = now
                 time.sleep(SCAN_INTERVAL)
@@ -283,7 +403,7 @@ def main():
 
             win_x, win_y, win_w, win_h, win_title = win_info
 
-            # Capture only the Citrix window region
+            # Capture only the target window region
             frame_gray = capture_x11_region(win_x, win_y, win_w, win_h)
             if frame_gray is None:
                 time.sleep(SCAN_INTERVAL)
@@ -302,19 +422,21 @@ def main():
 
                 if max_val >= MATCH_THRESHOLD:
                     match_x, match_y = max_loc
-                    center_x = win_x + match_x + (tw // 2)
-                    center_y = win_y + match_y + (th // 2)
+                    btn_screen_x = win_x + match_x
+                    btn_screen_y = win_y + match_y
 
                     logger.info(
-                        "TARGET MATCHED! Template '%s' (score: %.3f >= %.2f). Clicking at screen (%d, %d)",
+                        "TARGET MATCHED! Template '%s' (score: %.3f >= %.2f). Initiating click at (%d, %d, %dx%d)...",
                         tpl_name,
                         max_val,
                         MATCH_THRESHOLD,
-                        center_x,
-                        center_y,
+                        btn_screen_x,
+                        btn_screen_y,
+                        tw,
+                        th,
                     )
 
-                    clicked = click_screen_point(center_x, center_y)
+                    clicked = click_screen_box(btn_screen_x, btn_screen_y, tw, th)
                     if clicked:
                         metrics.record_click(tpl_name)
                     del res
@@ -322,7 +444,7 @@ def main():
 
                 del res
 
-            # Release frame from memory and collect garbage to guarantee RAM < 60 MB
+            # Release frame from memory and collect garbage
             del frame_gray
             if iteration % 25 == 0:
                 gc.collect()
@@ -334,7 +456,10 @@ def main():
                 time.sleep(CLICK_COOLDOWN)
             else:
                 elapsed = time.time() - loop_start
-                sleep_time = max(0.05, SCAN_INTERVAL - elapsed)
+                target_interval = SCAN_INTERVAL
+                if HUMAN_SCAN_JITTER and HUMAN_LIKE:
+                    target_interval += random.uniform(-0.15 * SCAN_INTERVAL, 0.20 * SCAN_INTERVAL)
+                sleep_time = max(0.05, target_interval - elapsed)
                 time.sleep(sleep_time)
 
     except Exception as e:
@@ -342,7 +467,71 @@ def main():
     finally:
         metrics.save_final()
         remove_pid()
-        logger.info("Citrix Copilot Allow-Bot stopped cleanly.")
+        logger.info("Allow-Bot stopped cleanly.")
+
+def cmd_status():
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            os.kill(pid, 0)
+            print(f"allow-bot is running (PID: {pid})")
+            return 0
+        except (ProcessLookupError, ValueError):
+            print("PID file exists but process is not running (stale PID).")
+            return 1
+        except PermissionError:
+            print("allow-bot is running (permission denied to check details).")
+            return 0
+    else:
+        print("allow-bot is stopped.")
+        return 1
+
+def cmd_stop():
+    if not PID_FILE.exists():
+        print("allow-bot is not running (no PID file found).")
+        return 0
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        print(f"Stopping allow-bot (PID: {pid})...")
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(30):
+            time.sleep(0.1)
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                print("Stopped successfully.")
+                if PID_FILE.exists():
+                    PID_FILE.unlink()
+                return 0
+        print("Process did not stop gracefully, sending SIGKILL...")
+        os.kill(pid, signal.SIGKILL)
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+        print("Stopped.")
+        return 0
+    except (ProcessLookupError, ValueError):
+        print("Process was not running. Cleaning up stale PID file.")
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+        return 0
+    except Exception as e:
+        print(f"Error stopping bot: {e}")
+        return 1
+
+def main():
+    action = sys.argv[1].lower() if len(sys.argv) > 1 else "start"
+    if action == "stop":
+        sys.exit(cmd_stop())
+    elif action == "status":
+        sys.exit(cmd_status())
+    elif action in ("start", "run"):
+        run_bot()
+    elif action in ("-h", "--help", "help"):
+        print("Usage: python bot.py [start|stop|status]")
+        sys.exit(0)
+    else:
+        print(f"Unknown action '{action}'. Usage: python bot.py [start|stop|status]")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
