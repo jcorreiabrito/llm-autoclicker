@@ -21,6 +21,7 @@ import gc
 import math
 import random
 import subprocess
+import argparse
 from pathlib import Path
 import cv2
 import numpy as np
@@ -44,9 +45,9 @@ DEBUG = int(os.getenv("DEBUG", "0")) == 1
 
 # Human-like simulation settings
 HUMAN_LIKE = int(os.getenv("HUMAN_LIKE", "1")) == 1
-HUMAN_MIN_REACTION = float(os.getenv("HUMAN_MIN_REACTION", "0.20"))
-HUMAN_MAX_REACTION = float(os.getenv("HUMAN_MAX_REACTION", "0.50"))
-HUMAN_MOUSE_SPEED = float(os.getenv("HUMAN_MOUSE_SPEED", "1.0"))
+HUMAN_MIN_REACTION = float(os.getenv("HUMAN_MIN_REACTION", "0.15"))
+HUMAN_MAX_REACTION = float(os.getenv("HUMAN_MAX_REACTION", "0.35"))
+HUMAN_MOUSE_SPEED = float(os.getenv("HUMAN_MOUSE_SPEED", "1.5"))
 HUMAN_SCAN_JITTER = int(os.getenv("HUMAN_SCAN_JITTER", "1")) == 1
 
 # Setup logging
@@ -219,8 +220,8 @@ def move_mouse_humanlike(target_x: int, target_y: int, speed_factor: float = 1.0
     beta = random.uniform(2.8, 4.2)    # Controls deceleration homing tail
 
     # 3. Dynamic duration based on Fitts's law + speed profile
-    base_duration = (0.16 + (distance / 1500.0) * random.uniform(0.75, 1.25)) / max(0.1, speed_factor)
-    steps = max(18, int(distance / 10))
+    base_duration = (0.12 + (distance / 1800.0) * random.uniform(0.70, 1.15)) / max(0.1, speed_factor)
+    steps = max(12, int(distance / 14))
     base_step_delay = base_duration / steps
 
     # 4. Bézier control points with randomized curvature
@@ -262,8 +263,8 @@ def move_mouse_humanlike(target_x: int, target_y: int, speed_factor: float = 1.0
 
     # 6. Corrective submovement if overshot
     if will_overshoot:
-        time.sleep(random.uniform(0.02, 0.05))  # Micro-pause before correction
-        correct_steps = random.randint(4, 7)
+        time.sleep(random.uniform(0.015, 0.035))  # Micro-pause before correction
+        correct_steps = random.randint(3, 5)
         cur_x, cur_y = get_current_pointer()
         for j in range(1, correct_steps + 1):
             ct = j / correct_steps
@@ -272,8 +273,8 @@ def move_mouse_humanlike(target_x: int, target_y: int, speed_factor: float = 1.0
             cx = int(cur_x + (target_x - cur_x) * st)
             cy = int(cur_y + (target_y - cur_y) * st)
             xtest.fake_input(x11_display, X.MotionNotify, x=cx, y=cy)
-            display.sync()
-            time.sleep(random.uniform(0.008, 0.018))
+            x11_display.sync()
+            time.sleep(random.uniform(0.005, 0.012))
 
     # Final position confirmation
     xtest.fake_input(x11_display, X.MotionNotify, x=target_x, y=target_y)
@@ -305,13 +306,13 @@ def click_screen_box(box_x: int, box_y: int, box_w: int, box_h: int):
             # 3. Smooth neuromuscular mouse movement
             move_mouse_humanlike(target_x, target_y, speed_factor=HUMAN_MOUSE_SPEED)
 
-            # 4. Pre-click micro hesitation (30ms - 80ms)
-            time.sleep(random.uniform(0.03, 0.08))
+            # 4. Pre-click micro hesitation (20ms - 50ms)
+            time.sleep(random.uniform(0.02, 0.05))
 
             # 5. Click with realistic down/up dwell time
             xtest.fake_input(x11_display, X.ButtonPress, 1)
             x11_display.sync()
-            time.sleep(random.uniform(0.05, 0.12))
+            time.sleep(random.uniform(0.04, 0.09))
             xtest.fake_input(x11_display, X.ButtonRelease, 1)
             x11_display.sync()
         else:
@@ -395,13 +396,19 @@ def load_templates(ref_dir: Path):
                 logger.warning("Could not parse image: %s", img_path.name)
     return templates
 
-def run_bot():
+def run_bot(human_like: bool = None, mouse_speed: float = None):
+    global HUMAN_LIKE, HUMAN_MOUSE_SPEED
+    if human_like is not None:
+        HUMAN_LIKE = human_like
+    if mouse_speed is not None:
+        HUMAN_MOUSE_SPEED = max(0.1, mouse_speed)
+
     if not has_x11:
         logger.critical("X11 display could not be opened. Terminating.")
         sys.exit(1)
 
     write_pid()
-    mode_str = "HUMAN-LIKE (Asymmetric Bézier curves + submovement correction)" if HUMAN_LIKE else "INSTANT"
+    mode_str = "HUMAN-LIKE (Asymmetric Bézier curves + submovement correction)" if HUMAN_LIKE else "INSTANT (Snap & Click)"
     logger.info("Allow-Bot started (PID: %d) [Mode: %s]", os.getpid(), mode_str)
     logger.info(
         "Settings: target='%s', threshold=%.2f, interval=%.2fs, cooldown=%.2fs",
@@ -568,19 +575,49 @@ def cmd_stop():
         return 1
 
 def main():
-    action = sys.argv[1].lower() if len(sys.argv) > 1 else "start"
-    if action == "stop":
+    parser = argparse.ArgumentParser(
+        description="Allow-Bot: Background automation to auto-click target permission dialogs."
+    )
+    parser.add_argument(
+        "action",
+        nargs="?",
+        default="start",
+        choices=["start", "run", "stop", "status"],
+        help="Action to execute (default: start)",
+    )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--instant",
+        "-i",
+        action="store_true",
+        help="Run in instant mode (snap directly and click without mouse curves or delays)",
+    )
+    mode_group.add_argument(
+        "--human",
+        "--human-like",
+        action="store_true",
+        help="Run in human-like mode (natural Bézier mouse curves & realistic reaction delays)",
+    )
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=None,
+        help="Override human-like mouse movement speed factor (e.g. 1.5, 2.0)",
+    )
+
+    args = parser.parse_args()
+
+    if args.action == "stop":
         sys.exit(cmd_stop())
-    elif action == "status":
+    elif args.action == "status":
         sys.exit(cmd_status())
-    elif action in ("start", "run"):
-        run_bot()
-    elif action in ("-h", "--help", "help"):
-        print("Usage: python bot.py [start|stop|status]")
-        sys.exit(0)
-    else:
-        print(f"Unknown action '{action}'. Usage: python bot.py [start|stop|status]")
-        sys.exit(1)
+    elif args.action in ("start", "run"):
+        human_like = None
+        if args.instant:
+            human_like = False
+        elif args.human:
+            human_like = True
+        run_bot(human_like=human_like, mouse_speed=args.speed)
 
 if __name__ == "__main__":
     main()
