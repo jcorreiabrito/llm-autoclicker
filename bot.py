@@ -49,6 +49,10 @@ HUMAN_MIN_REACTION = float(os.getenv("HUMAN_MIN_REACTION", "0.15"))
 HUMAN_MAX_REACTION = float(os.getenv("HUMAN_MAX_REACTION", "0.35"))
 HUMAN_MOUSE_SPEED = float(os.getenv("HUMAN_MOUSE_SPEED", "1.5"))
 HUMAN_SCAN_JITTER = int(os.getenv("HUMAN_SCAN_JITTER", "1")) == 1
+HUMAN_COOLDOWN_MOVE = int(os.getenv("HUMAN_COOLDOWN_MOVE", "0")) == 1
+HUMAN_IDLE_MOVE = int(os.getenv("HUMAN_IDLE_MOVE", "0")) == 1
+HUMAN_IDLE_MIN_INTERVAL = float(os.getenv("HUMAN_IDLE_MIN_INTERVAL", "30.0"))
+HUMAN_IDLE_MAX_INTERVAL = float(os.getenv("HUMAN_IDLE_MAX_INTERVAL", "90.0"))
 
 # Setup logging
 log_level = logging.DEBUG if DEBUG else logging.INFO
@@ -329,6 +333,138 @@ def click_screen_box(box_x: int, box_y: int, box_w: int, box_h: int):
         logger.error("Error simulating click at (%d, %d, %dx%d): %s", box_x, box_y, box_w, box_h, e)
         return False
 
+def cooldown_human_wander(win_x: int, win_y: int, win_w: int, win_h: int, duration: float):
+    """
+    Simulates natural post-click human idle behavior during cooldown:
+    - Brief post-click rest / pause on the button
+    - Smooth movement away from the clicked button towards the working area / center of window
+    - Subtle micro-sways or gentle drifts without clicking on anything
+    - Gracefully fills the cooldown duration while respecting shutdown signals
+    """
+    if not has_x11 or x11_display is None or not running or duration <= 0.1:
+        time.sleep(max(0.0, duration))
+        return
+
+    end_time = time.time() + duration
+
+    # 1. Post-click dwell pause (0.15s - 0.35s, capped to 25% of cooldown)
+    post_click_pause = min(random.uniform(0.15, 0.35), duration * 0.25)
+    time.sleep(post_click_pause)
+
+    if not running or time.time() >= end_time:
+        return
+
+    # 2. Pick a natural working-area landing spot within the window bounds
+    # (avoiding edges: 15% to 85% of width and 20% to 80% of height)
+    pad_x = max(10, int(win_w * 0.15))
+    pad_y = max(10, int(win_h * 0.20))
+    min_x = win_x + pad_x
+    max_x = win_x + max(pad_x, win_w - pad_x)
+    min_y = win_y + pad_y
+    max_y = win_y + max(pad_y, win_h - pad_y)
+
+    dest_x = random.randint(min_x, max_x)
+    dest_y = random.randint(min_y, max_y)
+
+    if DEBUG:
+        logger.debug("Cooldown idle wander: moving naturally to (%d, %d)", dest_x, dest_y)
+
+    # 3. Move cursor smoothly away towards the destination without any clicking
+    move_speed = HUMAN_MOUSE_SPEED * random.uniform(0.8, 1.2)
+    move_mouse_humanlike(dest_x, dest_y, speed_factor=move_speed)
+
+    # 4. If there's still significant time left in the cooldown, do a subtle secondary micro-drift
+    remaining = end_time - time.time()
+    if remaining > 0.4 and running and random.random() < 0.65:
+        pause_before_drift = min(random.uniform(0.1, 0.25), remaining * 0.4)
+        time.sleep(pause_before_drift)
+
+        remaining = end_time - time.time()
+        if remaining > 0.25 and running:
+            drift_dx = random.randint(-25, 25)
+            drift_dy = random.randint(-20, 20)
+            micro_x = max(min_x, min(max_x, dest_x + drift_dx))
+            micro_y = max(min_y, min(max_y, dest_y + drift_dy))
+            move_mouse_humanlike(micro_x, micro_y, speed_factor=HUMAN_MOUSE_SPEED * 1.3)
+
+    # 5. Sleep any remaining fraction of the cooldown time in responsive 50ms chunks
+    while running and time.time() < end_time:
+        time.sleep(min(0.05, end_time - time.time()))
+
+def perform_human_idle_movement(win_x: int, win_y: int, win_w: int, win_h: int):
+    """
+    Simulates ambient human-like mouse activity when no dialog appears to keep the session alive:
+    - Fast energetic flicks across the screen (anti-timeout keepalive)
+    - Casual curved roaming between different window areas
+    - Multi-step browsing/reading paths
+    - Subtle micro-fidgets and natural settlements
+    All movements remain strictly within window bounds without clicking anything.
+    """
+    if not has_x11 or x11_display is None or not running:
+        return
+
+    pad_x = max(15, int(win_w * 0.12))
+    pad_y = max(15, int(win_h * 0.15))
+    min_x = win_x + pad_x
+    max_x = win_x + max(pad_x, win_w - pad_x)
+    min_y = win_y + pad_y
+    max_y = win_y + max(pad_y, win_h - pad_y)
+
+    cur_x, cur_y = get_current_pointer()
+
+    # Pick a movement profile randomly:
+    # 0: Fast energetic flick (anti-timeout)
+    # 1: Casual roam across window
+    # 2: Two-step reading/browsing path
+    # 3: Subtle micro-fidget
+    profile = random.choices([0, 1, 2, 3], weights=[30, 35, 20, 15])[0]
+
+    if profile == 0:
+        # Fast energetic flick to wake screen / prevent timeout
+        dest_x = random.randint(min_x, max_x)
+        dest_y = random.randint(min_y, max_y)
+        speed = HUMAN_MOUSE_SPEED * random.uniform(2.0, 3.2)
+        if DEBUG:
+            logger.debug("Ambient idle: fast flick to (%d, %d)", dest_x, dest_y)
+        move_mouse_humanlike(dest_x, dest_y, speed_factor=speed)
+
+    elif profile == 1:
+        # Casual gentle roam across window
+        dest_x = random.randint(min_x, max_x)
+        dest_y = random.randint(min_y, max_y)
+        speed = HUMAN_MOUSE_SPEED * random.uniform(0.9, 1.4)
+        if DEBUG:
+            logger.debug("Ambient idle: casual roam to (%d, %d)", dest_x, dest_y)
+        move_mouse_humanlike(dest_x, dest_y, speed_factor=speed)
+
+    elif profile == 2:
+        # Two-step reading / navigating movement
+        p1_x = random.randint(min_x, max_x)
+        p1_y = random.randint(min_y, max_y)
+        speed1 = HUMAN_MOUSE_SPEED * random.uniform(1.2, 1.8)
+        if DEBUG:
+            logger.debug("Ambient idle: reading path step 1 to (%d, %d)", p1_x, p1_y)
+        move_mouse_humanlike(p1_x, p1_y, speed_factor=speed1)
+
+        if running:
+            time.sleep(random.uniform(0.08, 0.20))
+            # Shift slightly from step 1 (40-120px nearby)
+            p2_x = max(min_x, min(max_x, p1_x + random.randint(-120, 120)))
+            p2_y = max(min_y, min(max_y, p1_y + random.randint(-80, 80)))
+            speed2 = HUMAN_MOUSE_SPEED * random.uniform(1.0, 1.5)
+            if DEBUG:
+                logger.debug("Ambient idle: reading path step 2 to (%d, %d)", p2_x, p2_y)
+            move_mouse_humanlike(p2_x, p2_y, speed_factor=speed2)
+
+    elif profile == 3:
+        # Subtle micro-fidget nearby
+        fidget_x = max(min_x, min(max_x, cur_x + random.randint(-40, 40)))
+        fidget_y = max(min_y, min(max_y, cur_y + random.randint(-30, 30)))
+        speed = HUMAN_MOUSE_SPEED * random.uniform(1.4, 2.0)
+        if DEBUG:
+            logger.debug("Ambient idle: micro-fidget to (%d, %d)", fidget_x, fidget_y)
+        move_mouse_humanlike(fidget_x, fidget_y, speed_factor=speed)
+
 class MetricsTracker:
     def __init__(self, metrics_file: Path):
         self.metrics_file = metrics_file
@@ -396,12 +532,27 @@ def load_templates(ref_dir: Path):
                 logger.warning("Could not parse image: %s", img_path.name)
     return templates
 
-def run_bot(human_like: bool = None, mouse_speed: float = None):
-    global HUMAN_LIKE, HUMAN_MOUSE_SPEED
+def run_bot(
+    human_like: bool = None,
+    mouse_speed: float = None,
+    cooldown_move: bool = None,
+    idle_move: bool = None,
+    idle_min: float = None,
+    idle_max: float = None,
+):
+    global HUMAN_LIKE, HUMAN_MOUSE_SPEED, HUMAN_COOLDOWN_MOVE, HUMAN_IDLE_MOVE, HUMAN_IDLE_MIN_INTERVAL, HUMAN_IDLE_MAX_INTERVAL
     if human_like is not None:
         HUMAN_LIKE = human_like
     if mouse_speed is not None:
         HUMAN_MOUSE_SPEED = max(0.1, mouse_speed)
+    if cooldown_move is not None:
+        HUMAN_COOLDOWN_MOVE = cooldown_move
+    if idle_move is not None:
+        HUMAN_IDLE_MOVE = idle_move
+    if idle_min is not None:
+        HUMAN_IDLE_MIN_INTERVAL = max(5.0, idle_min)
+    if idle_max is not None:
+        HUMAN_IDLE_MAX_INTERVAL = max(HUMAN_IDLE_MIN_INTERVAL, idle_max)
 
     if not has_x11:
         logger.critical("X11 display could not be opened. Terminating.")
@@ -421,6 +572,8 @@ def run_bot(human_like: bool = None, mouse_speed: float = None):
     templates = load_templates(REF_IMAGES_DIR)
     last_template_check = time.time()
     last_window_missing_log = 0.0
+    last_activity_time = time.time()
+    next_idle_interval = random.uniform(HUMAN_IDLE_MIN_INTERVAL, HUMAN_IDLE_MAX_INTERVAL)
     iteration = 0
 
     metrics = MetricsTracker(PROJECT_DIR / "metrics.json")
@@ -509,8 +662,20 @@ def run_bot(human_like: bool = None, mouse_speed: float = None):
 
             if clicked:
                 logger.info("Entering cooldown (%.2fs)...", CLICK_COOLDOWN)
-                time.sleep(CLICK_COOLDOWN)
+                if HUMAN_LIKE and HUMAN_COOLDOWN_MOVE:
+                    cooldown_human_wander(win_x, win_y, win_w, win_h, CLICK_COOLDOWN)
+                else:
+                    time.sleep(CLICK_COOLDOWN)
+                last_activity_time = time.time()
+                next_idle_interval = random.uniform(HUMAN_IDLE_MIN_INTERVAL, HUMAN_IDLE_MAX_INTERVAL)
             else:
+                # Ambient anti-idle keep-alive movement when no button has appeared for a while
+                now = time.time()
+                if HUMAN_LIKE and HUMAN_IDLE_MOVE and (now - last_activity_time >= next_idle_interval):
+                    perform_human_idle_movement(win_x, win_y, win_w, win_h)
+                    last_activity_time = time.time()
+                    next_idle_interval = random.uniform(HUMAN_IDLE_MIN_INTERVAL, HUMAN_IDLE_MAX_INTERVAL)
+
                 elapsed = time.time() - loop_start
                 target_interval = SCAN_INTERVAL
                 if HUMAN_SCAN_JITTER and HUMAN_LIKE:
@@ -604,6 +769,43 @@ def main():
         default=None,
         help="Override human-like mouse movement speed factor (e.g. 1.5, 2.0)",
     )
+    parser.add_argument(
+        "--cooldown-move",
+        action="store_true",
+        help="Enable human-like mouse wandering away after clicking during cooldown",
+    )
+    parser.add_argument(
+        "--no-cooldown-move",
+        action="store_true",
+        help="Disable mouse movement during cooldown",
+    )
+    parser.add_argument(
+        "--idle-move",
+        action="store_true",
+        help="Enable ambient keep-alive mouse movements when no dialog appears",
+    )
+    parser.add_argument(
+        "--no-idle-move",
+        action="store_true",
+        help="Disable ambient mouse movements when no dialog appears",
+    )
+    parser.add_argument(
+        "--wander",
+        action="store_true",
+        help="Enable both cooldown wandering and ambient keep-alive movements",
+    )
+    parser.add_argument(
+        "--idle-min",
+        type=float,
+        default=None,
+        help="Minimum seconds of inactivity before ambient movement (default: 30.0)",
+    )
+    parser.add_argument(
+        "--idle-max",
+        type=float,
+        default=None,
+        help="Maximum seconds of inactivity before ambient movement (default: 90.0)",
+    )
 
     args = parser.parse_args()
 
@@ -617,7 +819,27 @@ def main():
             human_like = False
         elif args.human:
             human_like = True
-        run_bot(human_like=human_like, mouse_speed=args.speed)
+
+        cooldown_move = None
+        if args.wander or args.cooldown_move:
+            cooldown_move = True
+        elif args.no_cooldown_move:
+            cooldown_move = False
+
+        idle_move = None
+        if args.wander or args.idle_move:
+            idle_move = True
+        elif args.no_idle_move:
+            idle_move = False
+
+        run_bot(
+            human_like=human_like,
+            mouse_speed=args.speed,
+            cooldown_move=cooldown_move,
+            idle_move=idle_move,
+            idle_min=args.idle_min,
+            idle_max=args.idle_max,
+        )
 
 if __name__ == "__main__":
     main()

@@ -30,24 +30,35 @@ Copy `.env` and adjust as needed:
 | `HUMAN_MIN_REACTION` | `0.15`        | Minimum reaction delay in seconds before moving             |
 | `HUMAN_MAX_REACTION` | `0.35`        | Maximum reaction delay in seconds before moving             |
 | `HUMAN_MOUSE_SPEED`  | `1.5`         | Movement speed factor (1.0 = normal, higher = faster)       |
-| `HUMAN_SCAN_JITTER`  | `1`           | Add random timing variance to screen polling                |
-| `DEBUG`              | `0`           | Set to `1` for verbose logging                              |
+| `HUMAN_SCAN_JITTER`       | `1`           | Add random timing variance to screen polling                |
+| `HUMAN_COOLDOWN_MOVE`    | `0`           | Move mouse naturally during cooldown (default: disabled)    |
+| `HUMAN_IDLE_MOVE`        | `0`           | Move mouse naturally when idle to keep alive (default: off) |
+| `HUMAN_IDLE_MIN_INTERVAL`| `30.0`        | Minimum seconds before triggering ambient idle movement     |
+| `HUMAN_IDLE_MAX_INTERVAL`| `90.0`        | Maximum seconds before triggering ambient idle movement     |
+| `DEBUG`                  | `0`           | Set to `1` for verbose logging                              |
 
 ## Usage
 
 ```bash
-# Start bot (uses HUMAN_LIKE setting from .env by default)
+# Standard run (only clicks when the button appears, static otherwise)
 python bot.py start
 
-# Run with instant snap-and-click mode (no delays or mouse curves)
+# Instant mode (snaps directly and clicks with no delays)
 python bot.py start --instant
 # or shorthand:
 python bot.py -i
 
-# Run with human-like Bézier mouse movement
-python bot.py start --human
+# Enable natural cooldown wandering (moves away after clicking a button)
+python bot.py start --cooldown-move
 
-# Override mouse speed factor on the fly
+# Enable ambient idle keep-alive movement (wakes screen when idle)
+python bot.py start --idle-move
+python bot.py start --idle-move --idle-min 20 --idle-max 45
+
+# Enable all natural wanderings (both cooldown and ambient idle)
+python bot.py start --wander
+
+# Override mouse speed factor
 python bot.py start --human --speed 2.0
 
 # Management commands
